@@ -100,10 +100,7 @@ def write_to_exchange(exchange, obj):
     exchange.write("\n")
 
 def read_from_exchange(exchange):
-    line = exchange.readline()
-    if not line:
-        raise Exception("Connection closed by exchange.")
-    return orjson.loads(line)
+    return orjson.loads(exchange.readline())
 
 # ~~~~~============== TRADING HELPERS ==============~~~~~
 
