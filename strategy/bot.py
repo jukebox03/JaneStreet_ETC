@@ -147,7 +147,7 @@ def trade_bond(exchange):
         inflight_sell["BOND"] += make_sell
 
 # try to convert
-def _try_convert_pair(exchange, buy_id):
+def arb_convert(exchange, buy_id):
     pair = arb_pairs.get(buy_id)
     if not pair:
         return
@@ -160,10 +160,10 @@ def _try_convert_pair(exchange, buy_id):
         convert(exchange, "VALE", "BUY",  to_convert)  # give VALBZ, get VALE (cover short)
     pair["converted"] += to_convert
 
-def _close_pair_leg(exchange, order_id):
+def arb_order_finished(exchange, order_id):
     # check if this order is "buy" or "sell"
-    is_buy_leg = order_id in arb_pairs
-    if is_buy_leg:
+    is_buy = order_id in arb_pairs
+    if is_buy:
         buy_id = order_id
     elif order_id in arb_pair_by_sell:
         # buy finished
@@ -175,7 +175,7 @@ def _close_pair_leg(exchange, order_id):
         return
     pair = arb_pairs[buy_id]
 
-    if is_buy_leg: # buy fiiled
+    if is_buy: # buy filled
         pair["buy_done"] = True
         # shorted more than bought → cover excess short at market
         excess = pair["sell_filled"] - pair["buy_filled"]
@@ -198,7 +198,7 @@ def _close_pair_leg(exchange, order_id):
 
     if pair["buy_done"] and pair["sell_done"]:
         arb_pairs.pop(buy_id, None)
-        if is_buy_leg:
+        if is_buy:
             arb_pair_by_sell.pop(pair["sell_id"], None)
 
 
@@ -353,7 +353,7 @@ def main():
             fair[message["symbol"]] = message["price"]
             # if message["symbol"] in MM_SYMBOLS:
             #     place_mm(exchange, message["symbol"])
-        elif t == "fill":
+        elif t == "fill": # our order was filled (fully or partially)
             symbol = message["symbol"]
             size   = message["size"]
             price  = message["price"]
@@ -385,17 +385,17 @@ def main():
             elif symbol in ("VALE", "VALBZ"):
                 if order_id in arb_pairs:
                     arb_pairs[order_id]["buy_filled"] += size
-                    _try_convert_pair(exchange, order_id)
+                    arb_convert(exchange, order_id)
                 elif order_id in arb_pair_by_sell:
                     buy_id = arb_pair_by_sell[order_id]
                     if buy_id in arb_pairs:
                         arb_pairs[buy_id]["sell_filled"] += size
-                        _try_convert_pair(exchange, buy_id)
+                        arb_convert(exchange, buy_id)
             # else:
             #     place_mm(exchange, symbol)
             #     print("trade:", message, file=sys.stderr)
 
-        elif t == "ack":
+        elif t == "ack": # only for convert orders
             order_id = message["order_id"]
             if order_id in converts:
                 sym, dir, size = converts.pop(order_id)
@@ -408,7 +408,7 @@ def main():
                         position["VALBZ"] -= size
                     cash -= VALE_FEE * size
 
-        elif t == "out":
+        elif t == "out": # order is no longer active (can be triggered by cancel or fill)
             order_id = message["order_id"]
             if order_id in orders:
                 sym, dir, remaining = orders.pop(order_id)
@@ -417,7 +417,7 @@ def main():
                     inflight_buy[sym]  -= remaining
                 else:
                     inflight_sell[sym] -= remaining
-            _close_pair_leg(exchange, order_id)
+            arb_order_finished(exchange, order_id)
 
         elif t == "reject":
             print("reject:", message, file=sys.stderr)
