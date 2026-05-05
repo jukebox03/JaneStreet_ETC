@@ -308,14 +308,221 @@ def trade_etf(exchange):
 
 ## Phase 7 — Market Making (advanced)
 
-각 종목 fair 양옆에 bid/ask 깔아서 spread 수익. 핵심 고려사항:
+fair 양쪽에 bid/ask를 깔아두고 spread(bid-ask 차이)를 수익으로 챙기는 전략.
+누군가 내 bid를 치면 나는 싸게 사고, 누군가 내 ask를 치면 나는 비싸게 판 셈.
 
 ```
-1. delta = max(2, fair * 0.003)         # spread 폭 (가격의 ~0.3%)
-2. inventory skew                        # 재고 많으면 매도 호가 좁히고 매수 호가 넓혀서 자동 정리
-3. 호가 갱신 시 기존 주문 cancel 후 add  # 가격 바뀔 때마다
-4. EWMA volatility로 delta 동적 조정    # 시장 흔들릴 때 spread 넓힘
-5. AIMD fill-feedback                    # 너무 많이 체결되고 손실 나면 spread 확대
+수익 구조: ask에 팔고 bid에 사면 → spread 만큼 이익
+리스크:    fair가 내 예상과 다르게 움직이면 → 재고 손실
+```
+
+### 7-1. 기본 구조 (delta 고정)
+
+**MM 심볼**: BOND, GS, MS, WFC, XLF (VALE/VALBZ는 차익거래 전용)
+
+```python
+MM_SYMBOLS  = ["BOND", "GS", "MS", "WFC", "XLF"]
+BASE_RATIO  = 0.003    # spread 폭 = fair의 0.3%
+MM_SIZE     = 5        # 주문당 수량
+SOFT_LIMIT  = {"BOND": 80, "GS": 50, "MS": 50, "WFC": 50, "XLF": 60}
+
+# active MM 주문 추적: {(sym, "BUY"/"SELL"): order_id}
+mm_orders = {}
+```
+
+delta 계산:
+```python
+def calc_delta(sym, f):
+    if sym == "BOND":
+        return 1                          # BOND는 fair=1000 고정이라 spread 1로 충분
+    return max(2, int(f * BASE_RATIO))
+```
+
+호가 제출:
+```python
+def place_mm(exchange, sym):
+    f = get_fair(sym)
+    if f is None:
+        return
+
+    d   = calc_delta(sym, f)
+    bid = max(1, int(f - d))
+    ask = max(bid + 1, int(f + d))
+    lim  = POSITION_LIMITS[sym]
+    soft = SOFT_LIMIT.get(sym, lim)
+    pos  = position[sym]
+
+    # BUY 호가: 포지션이 soft limit 이내일 때만
+    if pos + MM_SIZE <= lim and pos < soft:
+        replace_quote(exchange, sym, "BUY",  bid)
+    else:
+        cancel_quote(exchange, sym, "BUY")
+
+    # SELL 호가: 포지션이 soft limit 이내일 때만
+    if pos - MM_SIZE >= -lim and pos > -soft:
+        replace_quote(exchange, sym, "SELL", ask)
+    else:
+        cancel_quote(exchange, sym, "SELL")
+```
+
+호가 교체 (가격 안 바뀌면 no-op):
+```python
+def replace_quote(exchange, sym, side, price):
+    key = (sym, side)
+    old_id = mm_orders.get(key)
+    if old_id is not None:
+        cancel_order(exchange, old_id)
+    oid = place_order(exchange, sym, side, price, MM_SIZE)
+    mm_orders[key] = oid
+
+def cancel_quote(exchange, sym, side):
+    key = (sym, side)
+    old_id = mm_orders.pop(key, None)
+    if old_id is not None:
+        cancel_order(exchange, old_id)
+```
+
+`trade` 핸들러에서 MM 심볼이면 requote:
+```python
+elif t == "trade":
+    sym = message["symbol"]
+    fair[sym] = message["price"]
+    if sym in MM_SYMBOLS:
+        place_mm(exchange, sym)
+```
+
+**검증**: 시뮬레이터에서 `[pnl/update]` 주기적으로 올라가는지 확인. P&L이 서서히 양수로 증가하면 성공.
+
+---
+
+### 7-2. Inventory Skew (재고 자동 정리)
+
+포지션이 쌓이면 한쪽 방향으로 계속 채워져서 limit에 막힘.
+**skew = 재고 방향으로 호가를 유리하게 조정** → 자연스럽게 청산 유도.
+
+```
+long 포지션 → ask를 좁혀서 팔기 쉽게, bid를 넓혀서 더 사기 어렵게
+short 포지션 → 반대
+```
+
+```python
+SKEW_K = 0.4   # skew 강도
+
+def calc_skewed_delta(sym, base_d):
+    soft = SOFT_LIMIT.get(sym, POSITION_LIMITS[sym])
+    norm = max(-1.0, min(1.0, position[sym] / soft))   # -1 ~ +1
+
+    bid_d = max(1, int(base_d * (1 + SKEW_K * norm)))  # long이면 bid 더 넓게
+    ask_d = max(1, int(base_d * (1 - SKEW_K * norm)))  # long이면 ask 더 좁게
+    return bid_d, ask_d
+```
+
+`place_mm` 수정:
+```python
+def place_mm(exchange, sym):
+    f = get_fair(sym)
+    if f is None:
+        return
+
+    base_d      = calc_delta(sym, f)
+    bid_d, ask_d = calc_skewed_delta(sym, base_d)    # ← 추가
+
+    bid = max(1, int(f - bid_d))
+    ask = max(bid + 1, int(f + ask_d))
+    ...
+```
+
+**검증**: 포지션이 한쪽으로 몰렸을 때 자동으로 줄어드는지 확인 (`print(position, file=sys.stderr)`).
+
+---
+
+### 7-3. EWMA Volatility (변동성 대응)
+
+시장이 급격히 움직일 때 spread를 넓혀서 불리한 체결 줄이기.
+
+```
+sigma 커지면 → delta 커짐 → spread 넓어짐 → 왠만한 가격엔 안 체결됨
+```
+
+```python
+import math
+
+EWMA_ALPHA = 0.004    # 반감기 ~170 틱
+VOL_K      = 25.0     # sigma가 ratio에 미치는 영향
+
+ewma_var = {}         # {sym: float}  EWMA 분산
+
+def update_vol(sym, price):
+    if sym in fair and fair[sym] > 0 and price > 0:
+        r = math.log(price / fair[sym])              # log return
+        prev = ewma_var.get(sym, 0.0)
+        ewma_var[sym] = (1 - EWMA_ALPHA) * prev + EWMA_ALPHA * r * r
+
+def calc_delta(sym, f):
+    if sym == "BOND":
+        return 1
+    sigma  = math.sqrt(ewma_var.get(sym, 0.0))
+    ratio  = BASE_RATIO * (1 + VOL_K * sigma)        # 변동성 반영
+    return max(2, int(f * ratio))
+```
+
+`trade` 핸들러에서 fair 갱신 전에 vol 업데이트:
+```python
+elif t == "trade":
+    sym   = message["symbol"]
+    price = message["price"]
+    update_vol(sym, price)     # ← fair 갱신 전에
+    fair[sym] = price
+    if sym in MM_SYMBOLS:
+        place_mm(exchange, sym)
+```
+
+---
+
+### 7-4. 전체 흐름 요약
+
+```
+trade 수신
+    ↓
+update_vol(sym, price)         # 변동성 갱신
+fair[sym] = price              # fair 갱신
+    ↓
+place_mm(exchange, sym)
+    ├── calc_delta             # 변동성 반영한 spread 폭
+    ├── calc_skewed_delta      # 재고에 따라 bid/ask 비대칭 조정
+    ├── position limit 체크    # limit 근처면 한쪽 호가 취소
+    └── replace_quote          # 가격 바뀐 경우에만 cancel+add
+```
+
+---
+
+### 7-5. 주의사항
+
+| 함정 | 해결 |
+|---|---|
+| trade마다 cancel+add → 500 msg/s 초과 | 가격 안 바뀌면 no-op (replace_quote에서 체크) |
+| on_out 안 처리 → mm_orders가 stale | `out` 수신 시 mm_orders에서 해당 oid 삭제 |
+| 양쪽 동시 체결 → 재고 0인데 호가 양쪽 다 있음 | fill 후 place_mm 다시 호출해서 limit 재확인 |
+| 차익거래와 MM이 같은 종목 두고 충돌 | SOFT_LIMIT으로 MM 여유 남겨두기 (hard limit보다 작게) |
+
+`on_out` 핸들러:
+```python
+elif t == "out":
+    oid = message["order_id"]
+    # mm_orders에서 stale 항목 제거
+    for key, val in list(mm_orders.items()):
+        if val == oid:
+            del mm_orders[key]
+            break
+```
+
+`on_fill` 핸들러 뒤에 requote 추가:
+```python
+elif t == "fill":
+    ...   # position/cash 갱신
+    sym = message["symbol"]
+    if sym in MM_SYMBOLS:
+        place_mm(exchange, sym)    # 체결 후 즉시 새 호가 제출
 ```
 
 기존 풀버전 참고: `git show 9075da5:strategy/bot.py`
