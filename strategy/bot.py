@@ -42,11 +42,11 @@ POSITION_LIMIT = {
 }
 
 # Market Making
-# MM_SYMBOLS = ["GS", "MS", "WFC", "XLF"] # except VALBZ and VALE
-# MM_WINDOW_RATIO = 0.003
-# HARD_LIMIT  = {"GS": 50, "MS": 50, "WFC": 50, "XLF": 60}
-# SKEW_K = 0.4
-# mm_orders = {} # (symbol, side) -> order_id
+MM_SYMBOLS = ["GS", "MS", "WFC", "XLF"] # except VALBZ and VALE
+MM_WINDOW_RATIO = 0.015 # 0.003 is bad
+HARD_LIMIT  = {"GS": 15, "MS": 15, "WFC": 15, "XLF": 15} # {"GS": 50, "MS": 50, "WFC": 50, "XLF": 60}
+SKEW_K = 0.8 # 0.4 is bad
+mm_orders = {} # (symbol, side) -> order_id
 
 # maximum number of in-flight orders
 MAX_ORDERS = 100
@@ -266,61 +266,61 @@ def trade_adr(exchange):
 
 # ~~~~~============== MARKET MAKING ==============~~~~~
 
-# def replace_quote(exchange, symbol, side, price):
-#     key = (symbol, side)
-#     old_id = mm_orders.get(key)
-#     if old_id:
-#         cancel_order(exchange, old_id)
-#     new_id = place_order(exchange, symbol, side, price, int(MAX_ORDERS * MM_order_ratio))
-#     mm_orders[key] = new_id
+def replace_quote(exchange, symbol, side, price):
+    key = (symbol, side)
+    old_id = mm_orders.get(key)
+    if old_id:
+        cancel_order(exchange, old_id)
+    new_id = place_order(exchange, symbol, side, price, int(MAX_ORDERS * MM_order_ratio))
+    mm_orders[key] = new_id
 
-# def cancel_quote(exchange, symbol, side):
-#     key = (symbol, side)
-#     if mm_orders.get(key) is None:
-#         return
-#     old_id = mm_orders.pop(key)
-#     if old_id:
-#         cancel_order(exchange, old_id)
-#         mm_orders[key] = None
+def cancel_quote(exchange, symbol, side):
+    key = (symbol, side)
+    if mm_orders.get(key) is None:
+        return
+    old_id = mm_orders.pop(key)
+    if old_id:
+        cancel_order(exchange, old_id)
+        mm_orders[key] = None
 
-# def calc_skewed_delta(symbol, base_d):
-#     limit = HARD_LIMIT[symbol]
-#     norm = max(-1.0, min(1.0, position[symbol] / limit))
-#     bid_d = max(1, int(base_d * (1 - SKEW_K * norm)))
-#     ask_d = max(1, int(base_d * (1 + SKEW_K * norm)))
-#     return bid_d, ask_d
+def calc_skewed_delta(symbol, base_d):
+    limit = HARD_LIMIT[symbol]
+    norm = max(-1.0, min(1.0, position[symbol] / limit)) # long position -> position >> 0 and norm ~= 1 -> low buy, high sell
+    bid_d = max(1, int(base_d * (1 + SKEW_K * norm))) # high buying price in long position -> low buy
+    ask_d = max(1, int(base_d * (1 - SKEW_K * norm))) # low selling price in long position -> high sell
+    return bid_d, ask_d
 
-# def place_mm(exchange, symbol):
-#     global position
+def place_mm(exchange, symbol):
+    global position
 
-#     fair_price = fair.get(symbol)
-#     if not fair_price:
-#         b = best_bid.get(symbol)
-#         a = best_ask.get(symbol)
-#         if b and a:
-#             fair_price = (b[0] + a[0]) // 2
-#     if not fair_price:
-#         return
+    fair_price = fair.get(symbol)
+    if not fair_price:
+        b = best_bid.get(symbol)
+        a = best_ask.get(symbol)
+        if b and a:
+            fair_price = (b[0] + a[0]) // 2
+    if not fair_price:
+        return
 
-#     delta = max(2, int(fair_price * MM_WINDOW_RATIO))
-#     bid_delta, ask_delta = calc_skewed_delta(symbol, delta)
+    delta = max(2, int(fair_price * MM_WINDOW_RATIO))
+    bid_delta, ask_delta = calc_skewed_delta(symbol, delta)
 
-#     bid = max(1, int(fair_price - bid_delta))
-#     ask = max(bid + 1, int(fair_price + ask_delta))
+    bid = max(1, int(fair_price - bid_delta))
+    ask = max(bid + 1, int(fair_price + ask_delta))
 
-#     hard_limit = HARD_LIMIT[symbol]
-#     sym_position = position[symbol]
-#     mm_size = int(MAX_ORDERS * MM_order_ratio)
+    hard_limit = HARD_LIMIT[symbol]
+    sym_position = position[symbol]
+    mm_size = int(MAX_ORDERS * MM_order_ratio)
 
-#     if sym_position + mm_size <= hard_limit:
-#         replace_quote(exchange, symbol, "BUY", bid)
-#     else:
-#         cancel_quote(exchange, symbol, "BUY")
+    if sym_position + mm_size <= hard_limit:
+        replace_quote(exchange, symbol, "BUY", bid)
+    else:
+        cancel_quote(exchange, symbol, "BUY")
 
-#     if sym_position - mm_size >= -hard_limit:
-#         replace_quote(exchange, symbol, "SELL", ask)
-#     else:
-#         cancel_quote(exchange, symbol, "SELL")
+    if sym_position - mm_size >= -hard_limit:
+        replace_quote(exchange, symbol, "SELL", ask)
+    else:
+        cancel_quote(exchange, symbol, "SELL")
 
 
 # ~~~~~============== MAIN LOOP ==============~~~~~
@@ -340,19 +340,20 @@ def main():
             break
         elif t == "hello":
             print("The exchange replied:", message, file=sys.stderr)
-            trade_bond(exchange)
+            # trade_bond(exchange)
         elif t == "book":
             symbol = message["symbol"]
             buys  = message.get("buy")  or []
             sells = message.get("sell") or []
             best_bid[symbol] = (buys[0][0],  buys[0][1])  if buys  else None
             best_ask[symbol] = (sells[0][0], sells[0][1]) if sells else None
-            if symbol in ["VALBZ", "VALE"]:
-                trade_adr(exchange)
+            # if symbol in ["VALBZ", "VALE"]:
+            #     trade_adr(exchange)
         elif t == "trade":
             fair[message["symbol"]] = message["price"]
-            # if message["symbol"] in MM_SYMBOLS:
-            #     place_mm(exchange, message["symbol"])
+            if message["symbol"] in MM_SYMBOLS:
+                place_mm(exchange, message["symbol"])
+                print(f"{t}\t{message['symbol']}\t-\t{message['price']}\t{message['size']}")
         elif t == "fill":
             symbol = message["symbol"]
             size   = message["size"]
@@ -380,20 +381,22 @@ def main():
                     orders[order_id] = (sym, d, remaining)
 
             if symbol == "BOND":
-                trade_bond(exchange)
+                # trade_bond(exchange)
                 pass
             elif symbol in ("VALE", "VALBZ"):
-                if order_id in arb_pairs:
-                    arb_pairs[order_id]["buy_filled"] += size
-                    _try_convert_pair(exchange, order_id)
-                elif order_id in arb_pair_by_sell:
-                    buy_id = arb_pair_by_sell[order_id]
-                    if buy_id in arb_pairs:
-                        arb_pairs[buy_id]["sell_filled"] += size
-                        _try_convert_pair(exchange, buy_id)
-            # else:
-            #     place_mm(exchange, symbol)
-            #     print("trade:", message, file=sys.stderr)
+                # if order_id in arb_pairs:
+                #     arb_pairs[order_id]["buy_filled"] += size
+                #     _try_convert_pair(exchange, order_id)
+                # elif order_id in arb_pair_by_sell:
+                #     buy_id = arb_pair_by_sell[order_id]
+                #     if buy_id in arb_pairs:
+                #         arb_pairs[buy_id]["sell_filled"] += size
+                #         _try_convert_pair(exchange, buy_id)
+                pass
+            elif symbol in MM_SYMBOLS:
+                place_mm(exchange, symbol)
+                print(f"FILLLLL\t{symbol}\t{dir}\t{price}\t{size}")
+                pass
 
         elif t == "ack":
             order_id = message["order_id"]
@@ -418,6 +421,9 @@ def main():
                 else:
                     inflight_sell[sym] -= remaining
             _close_pair_leg(exchange, order_id)
+            for key, oid in list(mm_orders.items()):
+                if oid == order_id:
+                    mm_orders.pop(key, None)
 
         elif t == "reject":
             print("reject:", message, file=sys.stderr)
