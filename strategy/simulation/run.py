@@ -27,6 +27,13 @@ def main():
                         help="Marketplace activity level")
     parser.add_argument("--round", type=float, default=300.0,
                         help="Round duration in seconds (default: 300)")
+    parser.add_argument("--rounds", type=int, default=None,
+                        help="Max number of rounds before shutting down "
+                             "(default: unlimited)")
+    parser.add_argument("--print-interval", type=float, default=None,
+                        metavar="SECONDS",
+                        help="Print fair market prices every N seconds "
+                             "(default: off)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility")
     parser.add_argument("--verbose", action="store_true",
@@ -41,6 +48,8 @@ def main():
         port=args.port,
         activity=activity,
         round_duration=args.round,
+        max_rounds=args.rounds,
+        print_interval=args.print_interval,
         seed=args.seed,
         verbose=args.verbose,
     )
