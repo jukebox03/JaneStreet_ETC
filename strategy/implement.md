@@ -436,7 +436,148 @@ def place_mm(exchange, sym):
 
 ---
 
-### 7-3. EWMA Volatility (변동성 대응)
+### 7-3. Emergency Liquidation (긴급 청산)
+
+가격이 급변하고 되돌아오지 않으면 skew만으로는 포지션을 털기 어려움.
+
+**기준: 최근 누적 drift가 기존 변동성의 K배를 넘고 포지션이 불리한 방향일 때 청산.**
+
+```
+drift     = 현재 가격 - EWMA 기준가 (최근 가격의 지수이동평균)
+ewma_vol  = EWMA of |drift|             (변동성 크기)
+z-score   = |drift| / ewma_vol
+
+z > DRIFT_K AND 포지션이 drift 반대 방향  →  긴급 청산
+```
+
+파라미터 추가:
+```python
+DRIFT_ALPHA   = 0.1   # 기준가 EWMA 감쇠 (~최근 10틱 반영)
+VOL_ALPHA     = 0.05  # 변동성 EWMA 감쇠 (~최근 20틱, 더 안정적)
+DRIFT_K       = 2.0   # flush 트리거 z-score 임계값
+RESUME_K      = 0.5   # 재개 조건 z-score (< DRIFT_K)
+FLUSH_MIN_CD  = 5     # 안정화 체크 전 최소 대기 틱 (즉시 재진입 방지)
+
+ewma_price  = {}                           # {sym: float} 기준선 (최근 가격 평균)
+ewma_vol    = {}                           # {sym: float} 기준선에서의 평균 이탈폭
+in_flush    = {s: False for s in MM_SYMBOLS}  # 긴급 청산 모드 여부
+flush_min   = {s: 0     for s in MM_SYMBOLS}  # 최소 대기 카운터
+```
+
+**`ewma_price` vs `ewma_vol`**:
+```
+ewma_price  = 최근 가격들의 지수평균  →  "기준선이 어디인가"
+ewma_vol    = |price - ewma_price|의 지수평균  →  "기준선에서 보통 얼마나 벗어나나"
+
+z = |현재가 - ewma_price| / ewma_vol  →  "지금 이탈이 평소의 몇 배인가"
+```
+
+EWMA 갱신 (trade 수신 시마다 호출):
+```python
+def update_drift(sym, price):
+    ep  = ewma_price.get(sym, price)
+    dev = abs(price - ep)
+    ewma_vol[sym]   = (1 - VOL_ALPHA)  * ewma_vol.get(sym, dev)  + VOL_ALPHA  * dev
+    ewma_price[sym] = (1 - DRIFT_ALPHA) * ep                      + DRIFT_ALPHA * price
+```
+
+flush 트리거 / 안정화 판단 (update_drift 호출 전에 평가):
+```python
+def z_score(sym, price):
+    ep  = ewma_price.get(sym)
+    vol = ewma_vol.get(sym, 0.0)
+    if ep is None or vol < 1.0:
+        return 0.0
+    return abs(price - ep) / vol
+
+def is_drift_flush(sym, price):
+    ep  = ewma_price.get(sym)
+    vol = ewma_vol.get(sym, 0.0)
+    if ep is None or vol < 1.0:
+        return False
+    drift = price - ep
+    pos   = position[sym]
+    adverse = (drift < 0 and pos > 0) or (drift > 0 and pos < 0)
+    return adverse and abs(drift) > DRIFT_K * vol
+
+def is_stable(sym, price):
+    """z-score가 RESUME_K 아래로 내려오면 시장 안정으로 판단."""
+    return z_score(sym, price) < RESUME_K
+```
+
+긴급 청산 실행:
+```python
+def emergency_flush(exchange, sym):
+    cancel_quote(exchange, sym, "BUY")
+    cancel_quote(exchange, sym, "SELL")
+    pos = position[sym]
+    if pos > 0:
+        ref = best_bid.get(sym)
+        if ref:
+            place_order(exchange, sym, "SELL", ref[0], pos)
+    elif pos < 0:
+        ref = best_ask.get(sym)
+        if ref:
+            place_order(exchange, sym, "BUY", ref[0], abs(pos))
+    in_flush[sym]  = True
+    flush_min[sym] = FLUSH_MIN_CD
+    print(f"[FLUSH] {sym} pos={pos}", file=sys.stderr)
+```
+
+`trade` 핸들러:
+```python
+elif t == "trade":
+    sym   = message["symbol"]
+    price = message["price"]
+    if sym in MM_SYMBOLS:
+        if in_flush[sym]:
+            if flush_min[sym] > 0:
+                flush_min[sym] -= 1
+            update_drift(sym, price)
+            fair[sym] = price
+            # 최소 대기 끝 + z-score 안정화 → MM 재개
+            if flush_min[sym] == 0 and is_stable(sym, price):
+                in_flush[sym] = False
+                place_mm(exchange, sym)
+                print(f"[RESUME] {sym}", file=sys.stderr)
+        elif is_drift_flush(sym, price):   # ← update_drift 전에 평가
+            update_drift(sym, price)
+            fair[sym] = price
+            if position[sym] != 0:
+                emergency_flush(exchange, sym)
+        else:
+            update_drift(sym, price)
+            fair[sym] = price
+            place_mm(exchange, sym)
+    else:
+        fair[sym] = price
+```
+
+**안정화 재개가 동작하는 원리**:
+```
+가격이 새 수준에 안착한 경우:
+  ewma_price가 천천히 새 수준으로 수렴 → drift 감소 → z < RESUME_K → 재개
+
+가격이 급변 후 원래 수준으로 회귀:
+  price가 ewma_price 쪽으로 돌아옴 → drift 감소 → z < RESUME_K → 재개 (더 빠름)
+```
+
+파라미터 튜닝:
+| 파라미터 | 낮추면 | 높이면 |
+|---|---|---|
+| `DRIFT_K` | flush 더 자주 (과잉 반응 위험) | flush 더 드물게 (대형 손실 방치 위험) |
+| `RESUME_K` | 더 완전히 안정된 뒤 재개 | 조금만 안정되면 바로 재개 |
+| `FLUSH_MIN_CD` | 최소 대기 짧음 (flush 후 빠른 재진입) | 최소 대기 긺 |
+| `DRIFT_ALPHA` | 기준가 천천히 이동 (drift 오래 유지 → 재개 느림) | 기준가 빠르게 현재가 추적 (재개 빠름) |
+
+> **주의**: `is_drift_flush`와 `is_stable`을 반드시 `update_drift` 전에 호출해야 함.  
+> 순서가 바뀌면 이미 갱신된 ewma_price 기준으로 비교해 z-score가 실제보다 작게 측정됨.
+
+**검증**: `--round 300 --verbose`로 가격 급변 시 `[FLUSH]` 로그가 찍히고 `position`이 0으로 수렴하는지 확인.
+
+---
+
+### 7-4. EWMA Volatility (변동성 대응)
 
 시장이 급격히 움직일 때 spread를 넓혀서 불리한 체결 줄이기.
 
@@ -479,24 +620,138 @@ elif t == "trade":
 
 ---
 
-### 7-4. 전체 흐름 요약
+### 7-5. Order Book Pressure (호가창 압력)
+
+7-3의 flush는 trade 메시지(체결) 기반 — 이미 가격이 움직인 후에 반응.  
+**book 메시지의 bid/ask 수량 불균형을 보면 가격 이동 전에 선제 대응 가능**.
 
 ```
+bid 수량 >> ask 수량  →  매수 압력 → 가격 오를 가능성  →  short이면 위험
+ask 수량 >> bid 수량  →  매도 압력 → 가격 내릴 가능성  →  long이면 위험
+```
+
+파라미터:
+```python
+IMB_FAIR_FACTOR = 0.5   # imbalance가 fair 보정에 미치는 영향
+IMB_CANCEL_THR  = 0.7   # |imbalance| > 0.7 이면 선제 호가 취소
+```
+
+Imbalance 계산 및 fair 보정:
+```python
+def book_imbalance(sym):
+    b = best_bid.get(sym)
+    a = best_ask.get(sym)
+    if not b or not a or (b[1] + a[1]) == 0:
+        return 0.0
+    return (b[1] - a[1]) / (b[1] + a[1])   # +1=bid 우세, -1=ask 우세
+
+def get_fair_imbalance_adjusted(sym):
+    b = best_bid.get(sym)
+    a = best_ask.get(sym)
+    if not b or not a:
+        return fair.get(sym)
+    mid  = (b[0] + a[0]) / 2
+    imb  = book_imbalance(sym)
+    half = (a[0] - b[0]) / 2
+    # bid 압도적이면 fair를 mid보다 약간 높게, ask 압도적이면 낮게
+    return mid + imb * half * IMB_FAIR_FACTOR
+```
+
+`place_mm`에서 fair 추정에 활용:
+```python
+def place_mm(exchange, sym):
+    f = get_fair_imbalance_adjusted(sym)   # ← fair.get(sym) 대신
+    if f is None:
+        return
+    ...
+```
+
+선제적 호가 취소 (`book` 핸들러에서):
+```python
+elif t == "book":
+    sym = message["symbol"]
+    ...  # best_bid / best_ask 갱신
+    if sym in MM_SYMBOLS and flush_cd.get(sym, 0) == 0:
+        imb = book_imbalance(sym)
+        pos = position[sym]
+        if imb > IMB_CANCEL_THR and pos < 0:    # bid 압도 + short → BUY 호가 취소
+            cancel_quote(exchange, sym, "BUY")
+        elif imb < -IMB_CANCEL_THR and pos > 0: # ask 압도 + long → SELL 호가 취소
+            cancel_quote(exchange, sym, "SELL")
+```
+
+> full flush(포지션 청산)보다 보수적인 반응: 호가만 취소하고 기존 포지션은 유지.  
+> 시장이 회복하면 다음 trade 틱에서 `place_mm`이 재호가를 올림.
+
+**검증**: 한쪽 imbalance가 클 때 적절한 호가 취소 로그 찍히는지 확인.
+
+---
+
+### 7-6. Adaptive Flush Threshold (적응형 청산 임계값)
+
+7-3의 `DRIFT_K`는 고정값. **7-4의 `ewma_var`(spread 단위 σ)를 활용해 `DRIFT_K`를 동적으로 낮추면, 이미 변동성이 높은 국면에서 더 빠르게 청산 트리거.**
+
+```
+σ 낮음 (calm)    →  DRIFT_K 유지 (기본값, 느슨하게)
+σ 높음 (turbulent) →  DRIFT_K 축소 (더 민감하게)
+```
+
+7-3의 `is_drift_flush`만 수정:
+```python
+def is_drift_flush(sym, price):
+    ep  = ewma_price.get(sym)
+    vol = ewma_vol.get(sym, 0.0)
+    if ep is None or vol < 1.0:
+        return False
+    drift = price - ep
+    pos   = position[sym]
+    adverse = (drift < 0 and pos > 0) or (drift > 0 and pos < 0)
+    if not adverse:
+        return False
+
+    # vol_ratio: 현재 σ가 spread 폭 대비 얼마나 큰가
+    sigma     = math.sqrt(ewma_var.get(sym, 0.0))
+    vol_ratio = sigma / max(MM_WINDOW_RATIO, 1e-9)
+    k = max(1.0, DRIFT_K / (1.0 + vol_ratio))   # ← 동적 DRIFT_K
+    return abs(drift) > k * vol
+```
+
+> **구현 순서**: 반드시 7-4 이후에 적용 (`ewma_var` 없으면 vol_ratio=0 → 기본 `DRIFT_K`와 동일).
+
+**검증**: 변동성 높은 구간에서 flush가 더 일찍 발생하는지 `[FLUSH]` 로그 타이밍 비교.
+
+---
+
+### 7-7. 전체 흐름 요약
+
+```
+book 수신
+    ↓
+best_bid/best_ask 갱신
+book_imbalance 계산 (7-5)
+    → 압력 극단적 + 역방향 포지션 → cancel_quote (선제 취소)
+
 trade 수신
     ↓
-update_vol(sym, price)         # 변동성 갱신
-fair[sym] = price              # fair 갱신
-    ↓
-place_mm(exchange, sym)
-    ├── calc_delta             # 변동성 반영한 spread 폭
-    ├── calc_skewed_delta      # 재고에 따라 bid/ask 비대칭 조정
-    ├── position limit 체크    # limit 근처면 한쪽 호가 취소
-    └── replace_quote          # 가격 바뀐 경우에만 cancel+add
+in_flush[sym]?  (7-3)
+    ├── YES → flush_min -= 1, update_drift, fair 갱신
+    │         flush_min==0 AND is_stable? → in_flush=False, place_mm (재개)
+    └── NO  →
+        is_drift_flush?  ← update_drift 전에 평가 (k는 7-6으로 동적 조정)
+            ├── YES → update_drift, fair 갱신, emergency_flush (in_flush=True)
+            └── NO  → update_drift, fair 갱신
+                           update_vol(sym, price)         # EWMA 분산 갱신 (7-4)
+                           place_mm(exchange, sym)
+                               ├── get_fair_imbalance_adjusted  # imbalance 보정 (7-5)
+                               ├── calc_delta                   # vol 반영 spread (7-4)
+                               ├── calc_skewed_delta             # 재고 비대칭 조정 (7-2)
+                               ├── position limit 체크
+                               └── replace_quote
 ```
 
 ---
 
-### 7-5. 주의사항
+### 7-8. 주의사항
 
 | 함정 | 해결 |
 |---|---|
@@ -563,4 +818,9 @@ python3 strategy/simulation/run.py --round 300 --rounds 1 --verbose --seed 1
 - [ ] Phase 4: BOND 전략 — P&L > 0
 - [ ] Phase 5: ADR 차익 — VALE divergence 이벤트 잡음
 - [ ] Phase 6: ETF 차익 — XLF divergence 이벤트 잡음
-- [ ] Phase 7: Market making — 모든 종목에 호가 제출
+- [ ] Phase 7-1: Market making — 모든 종목에 호가 제출
+- [ ] Phase 7-2: Inventory Skew — 포지션 한쪽 쏠림 자동 해소
+- [ ] Phase 7-3: Emergency Liquidation — shock/trend 시 포지션 강제 0
+- [ ] Phase 7-4: EWMA Volatility — 변동성 급등 시 spread 자동 확대
+- [ ] Phase 7-5: Order Book Pressure — imbalance 기반 fair 보정 + 선제 취소
+- [ ] Phase 7-6: Adaptive Flush — σ에 따라 청산 임계값 자동 조정 (7-4 필요)

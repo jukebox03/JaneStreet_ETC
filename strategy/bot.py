@@ -42,11 +42,24 @@ POSITION_LIMIT = {
 }
 
 # Market Making
-MM_SYMBOLS = ["GS", "MS", "WFC", "XLF"] # except VALBZ and VALE
+MM_SYMBOLS = ["GS", "MS", "WFC"] # except VALBZ and VALE
 MM_WINDOW_RATIO = 0.015 # 0.003 is bad
-HARD_LIMIT  = {"GS": 15, "MS": 15, "WFC": 15, "XLF": 15} # {"GS": 50, "MS": 50, "WFC": 50, "XLF": 60}
+HARD_LIMIT  = {"GS": 15, "MS": 15, "WFC": 15} # {"GS": 50, "MS": 50, "WFC": 50}
 SKEW_K = 0.8 # 0.4 is bad
 mm_orders = {} # (symbol, side) -> order_id
+
+# emergency close # ewma
+DRIFT_ALPHA = 0.1 # avg # EWMA alpha (degradation) ~ 0.1 means considering latest 10% value
+VOL_ALPHA = 0.05 # variance # EWMA alpha (degradation) ~ 0.05 means considering latest 20% value
+DRIFT_K = 2.0 # z-score threshold to pause trading (close MM)
+RESUME_K = 0.5 # z-score threshold to resume trading (restart MM)
+FLUSH_MIN_CD = 5 # minimum cooldown time
+
+ewma_price = {} # symbol -> ewma_price
+ewma_vol = {} # symbol -> ewma_vol
+
+in_flush = {s: False for s in SYMBOLS} # whether currently in flush
+flush_min = {s: 0 for s in SYMBOLS} # min price during flush
 
 # maximum number of in-flight orders
 MAX_ORDERS = 100
@@ -266,6 +279,7 @@ def trade_adr(exchange):
 
 # ~~~~~============== MARKET MAKING ==============~~~~~
 
+# basic MM
 def replace_quote(exchange, symbol, side, price):
     key = (symbol, side)
     old_id = mm_orders.get(key)
@@ -283,12 +297,65 @@ def cancel_quote(exchange, symbol, side):
         cancel_order(exchange, old_id)
         mm_orders[key] = None
 
+# dynamic delta
 def calc_skewed_delta(symbol, base_d):
     limit = HARD_LIMIT[symbol]
     norm = max(-1.0, min(1.0, position[symbol] / limit)) # long position -> position >> 0 and norm ~= 1 -> low buy, high sell
     bid_d = max(1, int(base_d * (1 + SKEW_K * norm))) # high buying price in long position -> low buy
     ask_d = max(1, int(base_d * (1 - SKEW_K * norm))) # low selling price in long position -> high sell
     return bid_d, ask_d
+
+# EWMA for emergency close
+def update_ewma(symbol, price):
+    ep = ewma_price.get(symbol, price)
+    dev = abs(price - ep) # not square ??
+    ev = ewma_vol.get(symbol, dev)
+
+    ewma_price[symbol] = ep * (1 - DRIFT_ALPHA) + price * DRIFT_ALPHA
+    ewma_vol[symbol] = ev * (1 - VOL_ALPHA) + dev * VOL_ALPHA
+
+def z_score_abs(symbol, price):
+    ep = ewma_price.get(symbol)
+    ev = ewma_vol.get(symbol)
+    if ep is None or ev is None or ev < 1: # TODO : ev == 0 ??
+        return 0
+    return abs(price - ep) / ev # TODO : why abs?
+
+def is_flush(symbol, price):
+    ep = ewma_price.get(symbol)
+    ev = ewma_vol.get(symbol)
+    if ep is None or ev is None or ev < 1:
+        return False
+    dev = price - ep
+    pos = position[symbol]
+    reverse = (dev < 0 and pos > 0) or (dev > 0 and pos < 0) # position in the opposite direction of drift -> risky
+    return reverse and abs(dev) > DRIFT_K * ev  # same with "z > DRIFT_K"
+
+def is_stable(symbol, price):
+    return z_score_abs(symbol, price) < RESUME_K
+
+def emergency_close(exchange, symbol):
+    cancel_quote(exchange, symbol, "BUY")
+    cancel_quote(exchange, symbol, "SELL")
+
+    pos = position[symbol]
+    if pos > 0:
+        ref = best_bid.get(symbol)
+        if ref:
+            place_order(exchange, symbol, "SELL", ref[0], pos)
+        else:
+            # TODO
+            pass
+    elif pos < 0:
+        ref = best_ask.get(symbol)
+        if ref:
+            place_order(exchange, symbol, "BUY", ref[0], -pos)
+        else:
+            # TODO
+            pass
+    in_flush[symbol] = True
+    flush_min[symbol] = FLUSH_MIN_CD
+    print(f"[FLUSH] {symbol} pos={pos}", file=sys.stderr)
 
 def place_mm(exchange, symbol):
     global position
@@ -350,10 +417,27 @@ def main():
             # if symbol in ["VALBZ", "VALE"]:
             #     trade_adr(exchange)
         elif t == "trade":
-            fair[message["symbol"]] = message["price"]
-            if message["symbol"] in MM_SYMBOLS:
-                place_mm(exchange, message["symbol"])
-                print(f"{t}\t{message['symbol']}\t-\t{message['price']}\t{message['size']}")
+            symbol = message["symbol"]
+            price = message["price"]
+            fair[symbol] = price
+            if symbol in MM_SYMBOLS:
+                if in_flush[symbol]:
+                    if flush_min[symbol] > 0:
+                        flush_min[symbol] -= 1
+                    update_ewma(symbol, price)
+
+                    if flush_min[symbol] == 0 and is_stable(symbol, price):
+                        in_flush[symbol] = False
+                        place_mm(exchange, symbol)
+                        print(f"[RESUME] {symbol}", file=sys.stderr)
+                elif is_flush(symbol, price):
+                    update_ewma(symbol, price)
+                    if position[symbol] != 0:
+                        emergency_close(exchange, symbol)
+                else:
+                    update_ewma(symbol, price)
+                    place_mm(exchange, symbol)
+                # print(f"{t}\t{symbol}\t-\t{price}\t{message['size']}")
         elif t == "fill":
             symbol = message["symbol"]
             size   = message["size"]
