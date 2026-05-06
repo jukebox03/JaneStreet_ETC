@@ -43,23 +43,24 @@ POSITION_LIMIT = {
 
 # Market Making
 MM_SYMBOLS = ["GS", "MS", "WFC"] # except VALBZ and VALE
-MM_WINDOW_RATIO = 0.015 # 0.003 is bad
+MM_WINDOW_RATIO = 0.008 # 0.003 is bad
 HARD_LIMIT  = {"GS": 15, "MS": 15, "WFC": 15} # {"GS": 50, "MS": 50, "WFC": 50}
 SKEW_K = 0.8 # 0.4 is bad
 mm_orders = {} # (symbol, side) -> order_id
 
 # emergency close # ewma
-DRIFT_ALPHA = 0.1 # avg # EWMA alpha (degradation) ~ 0.1 means considering latest 10% value
+DRIFT_ALPHA = 0.05 # avg # EWMA alpha (degradation) ~ 0.1 means considering latest 10% value
 VOL_ALPHA = 0.05 # variance # EWMA alpha (degradation) ~ 0.05 means considering latest 20% value
-DRIFT_K = 2.0 # z-score threshold to pause trading (close MM)
+DRIFT_K = 2.5 # z-score threshold to pause trading (close MM)
 RESUME_K = 0.5 # z-score threshold to resume trading (restart MM)
 FLUSH_MIN_CD = 5 # minimum cooldown time
 
 ewma_price = {} # symbol -> ewma_price
 ewma_vol = {} # symbol -> ewma_vol
 
-in_flush = {s: False for s in SYMBOLS} # whether currently in flush
-flush_min = {s: 0 for s in SYMBOLS} # min price during flush
+in_flush  = {s: False for s in SYMBOLS}    # whether currently in flush
+flush_min = {s: 0     for s in SYMBOLS}    # minimum cooldown counter
+flush_oid = {s: None  for s in MM_SYMBOLS} # order_id of active flush order (Bug 4)
 
 # maximum number of in-flight orders
 MAX_ORDERS = 100
@@ -339,20 +340,15 @@ def emergency_close(exchange, symbol):
     cancel_quote(exchange, symbol, "SELL")
 
     pos = position[symbol]
+    flush_oid[symbol] = None
     if pos > 0:
         ref = best_bid.get(symbol)
         if ref:
-            place_order(exchange, symbol, "SELL", ref[0], pos)
-        else:
-            # TODO
-            pass
+            flush_oid[symbol] = place_order(exchange, symbol, "SELL", ref[0], pos)
     elif pos < 0:
         ref = best_ask.get(symbol)
         if ref:
-            place_order(exchange, symbol, "BUY", ref[0], -pos)
-        else:
-            # TODO
-            pass
+            flush_oid[symbol] = place_order(exchange, symbol, "BUY", ref[0], -pos)
     in_flush[symbol] = True
     flush_min[symbol] = FLUSH_MIN_CD
     print(f"[FLUSH] {symbol} pos={pos}", file=sys.stderr)
@@ -478,9 +474,9 @@ def main():
                 #         _try_convert_pair(exchange, buy_id)
                 pass
             elif symbol in MM_SYMBOLS:
-                place_mm(exchange, symbol)
                 print(f"FILLLLL\t{symbol}\t{dir}\t{price}\t{size}")
-                pass
+                if not in_flush[symbol]:
+                    place_mm(exchange, symbol)
 
         elif t == "ack":
             order_id = message["order_id"]
@@ -508,6 +504,21 @@ def main():
             for key, oid in list(mm_orders.items()):
                 if oid == order_id:
                     mm_orders.pop(key, None)
+            # Bug 4: flush 주문이 미체결로 out되면 잔여 포지션 재청산
+            for sym in MM_SYMBOLS:
+                if flush_oid.get(sym) == order_id:
+                    flush_oid[sym] = None
+                    if in_flush[sym] and position[sym] != 0:
+                        pos = position[sym]
+                        if pos > 0:
+                            ref = best_bid.get(sym)
+                            if ref:
+                                flush_oid[sym] = place_order(exchange, sym, "SELL", ref[0], pos)
+                        elif pos < 0:
+                            ref = best_ask.get(sym)
+                            if ref:
+                                flush_oid[sym] = place_order(exchange, sym, "BUY", ref[0], -pos)
+                    break
 
         elif t == "reject":
             print("reject:", message, file=sys.stderr)
