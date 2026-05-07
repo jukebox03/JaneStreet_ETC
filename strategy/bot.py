@@ -83,7 +83,7 @@ orders = {}
 converts = {}
 
 # arb
-# bid/sid -> { buy_id, sell_id, size, buy_filled, sell_filled, converted, case }
+# bid/sid -> { buy_id, sell_id, buy_filled, sell_filled, converted, case }
 arb = {}
 
 # ~~~~~============== NETWORKING CODE ==============~~~~~
@@ -190,7 +190,7 @@ def trade_adr(exchange):
             sid = place_order(exchange, "VALE",  "SELL", vb[0],  size)
             inflight_buy["VALBZ"]  += size
             inflight_sell["VALE"]  += size
-            pair = {"buy_id": bid, "sell_id": sid, "size": size, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 2}
+            pair = {"buy_id": bid, "sell_id": sid, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 2}
             arb[bid] = arb[sid] = pair
 
 
