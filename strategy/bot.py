@@ -52,8 +52,10 @@ POSITION_LIMIT = {
 MAX_ORDERS = 100
 
 # order ratio
-BOND_order_ratio = 0.05
-MM_order_ratio = 0.1
+# MM_order_ratio = 0.1
+
+# bond slot
+BOND_SLOTS = 5
 
 # FEE
 VALE_FEE = 10
@@ -67,12 +69,12 @@ inflight_sell = {s: 0 for s in SYMBOLS}
 inflight_buy = {s: 0 for s in SYMBOLS}
 cash = 0
 
-# fair price
-fair = {}
-
 # order books
 best_bid = {}
 best_ask = {}
+
+# fair value
+fair = {}
 
 # in-flight orders: order_id -> (symbol, dir, remaining_size)
 orders = {}
@@ -80,11 +82,9 @@ orders = {}
 # pending converts: order_id -> (symbol, dir, size)
 converts = {}
 
-# arb pairs: buy_id -> {sell_id, size, buy_filled, sell_filled, converted, buy_done, sell_done, case}
-arb_pairs = {}
-arb_pair_by_sell = {}  # sell_id -> buy_id
-
-
+# arb
+# bid/sid -> { buy_id, sell_id, size, buy_filled, sell_filled, converted, case }
+arb = {}
 
 # ~~~~~============== NETWORKING CODE ==============~~~~~
 def connect():
@@ -104,14 +104,14 @@ def read_from_exchange(exchange):
 
 # ~~~~~============== TRADING HELPERS ==============~~~~~
 
-order_id = 0
+_oid = 0
 
 def place_order(exchange, symbol, dir, price, size):
-    global order_id
-    order_id += 1
-    orders[order_id] = (symbol, dir, size)
-    write_to_exchange(exchange, {"type": "add", "order_id": order_id, "symbol": symbol, "dir": dir, "price": int(price), "size": int(size)})
-    return order_id
+    global _oid
+    _oid += 1
+    orders[_oid] = (symbol, dir, size)
+    write_to_exchange(exchange, {"type": "add", "order_id": _oid, "symbol": symbol, "dir": dir, "price": int(price), "size": int(size)})
+    return _oid
 
 def cancel_order(exchange, oid):
     write_to_exchange(exchange, {"type": "cancel", "order_id": oid})
@@ -120,22 +120,19 @@ def convert(exchange, symbol, dir, size):
     if symbol == "XLF" and size % 10 != 0:
         print("XLF can only be converted in multiples of 10.", file=sys.stderr)
         return -1
-    global order_id
-    order_id += 1
-    converts[order_id] = (symbol, dir, size)
-    write_to_exchange(exchange, {"type": "convert", "order_id": order_id, "symbol": symbol, "dir": dir, "size": int(size)})
-    return order_id
+    global _oid
+    _oid += 1
+    converts[_oid] = (symbol, dir, size)
+    write_to_exchange(exchange, {"type": "convert", "order_id": _oid, "symbol": symbol, "dir": dir, "size": int(size)})
+    return _oid
 
 # ~~~~~============== TRADING FUNCTIONS ==============~~~~~
 
 def trade_bond(exchange):
-    global position, inflight_buy, inflight_sell
-    bond_position = position["BOND"]
-    limit = POSITION_LIMIT["BOND"]
-    bond_inflight_buy = inflight_buy["BOND"]
-    bond_inflight_sell = inflight_sell["BOND"]
-    make_buy  = min(MAX_ORDERS * BOND_order_ratio - bond_inflight_buy,  limit - bond_position)
-    make_sell = min(MAX_ORDERS * BOND_order_ratio - bond_inflight_sell, limit + bond_position)
+    lim = POSITION_LIMIT["BOND"]
+    pos = position["BOND"]
+    make_buy = min(BOND_SLOTS - inflight_buy["BOND"], lim - pos)
+    make_sell = min(BOND_SLOTS - inflight_sell["BOND"], lim + pos)
     if make_buy > 0:
         place_order(exchange, "BOND", "BUY", 999, make_buy)
         inflight_buy["BOND"] += make_buy
@@ -143,122 +140,58 @@ def trade_bond(exchange):
         place_order(exchange, "BOND", "SELL", 1001, make_sell)
         inflight_sell["BOND"] += make_sell
 
-# try to convert
-def arb_convert(exchange, buy_id):
-    pair = arb_pairs.get(buy_id)
-    if not pair:
-        return
-    to_convert = min(pair["buy_filled"], pair["sell_filled"]) - pair["converted"]
-    if to_convert <= 0:
-        return
-    if pair["case"] == 1:
-        convert(exchange, "VALE", "SELL", to_convert)  # give VALE, get VALBZ (cover short)
-    else:
-        convert(exchange, "VALE", "BUY",  to_convert)  # give VALBZ, get VALE (cover short)
-    pair["converted"] += to_convert
-
-def arb_order_finished(exchange, order_id):
-    # check if this order is "buy" or "sell"
-    is_buy = order_id in arb_pairs
-    if is_buy:
-        buy_id = order_id
-    elif order_id in arb_pair_by_sell:
-        # buy finished
-        buy_id = arb_pair_by_sell.pop(order_id)
-    else:
-        return
-
-    if buy_id not in arb_pairs:
-        return
-    pair = arb_pairs[buy_id]
-
-    if is_buy: # buy filled
-        pair["buy_done"] = True
-        # shorted more than bought → cover excess short at market
-        excess = pair["sell_filled"] - pair["buy_filled"]
-        if excess > 0:
-            sym = "VALBZ" if pair["case"] == 1 else "VALE"
-            ref = best_ask.get(sym)
-            if ref:
-                place_order(exchange, sym, "BUY", ref[0], excess)
-                inflight_buy[sym] += excess
-    else: # sell filled
-        pair["sell_done"] = True
-        # bought more than shorted → sell excess long at market
-        excess = pair["buy_filled"] - pair["sell_filled"]
-        if excess > 0:
-            sym = "VALE" if pair["case"] == 1 else "VALBZ"
-            ref = best_bid.get(sym)
-            if ref:
-                place_order(exchange, sym, "SELL", ref[0], excess)
-                inflight_sell[sym] += excess
-
-    if pair["buy_done"] and pair["sell_done"]:
-        arb_pairs.pop(buy_id, None)
-        if is_buy:
-            arb_pair_by_sell.pop(pair["sell_id"], None)
-
-
 def trade_adr(exchange):
-    global best_ask, best_bid, position
+    va = best_ask.get("VALE")
+    vb = best_bid.get("VALE")
+    bza = best_ask.get("VALBZ")
+    bzb = best_bid.get("VALBZ")
 
-    vale_low   = best_ask.get("VALE")
-    vale_high  = best_bid.get("VALE")
-    valbz_low  = best_ask.get("VALBZ")
-    valbz_high = best_bid.get("VALBZ")
-
-    if not vale_high or not vale_low or not valbz_high or not valbz_low:
+    if not (va and vb and bza and bzb):
         return
 
-    # Cancel pairs whose arb condition has disappeared
-    for buy_id, pair in list(arb_pairs.items()):
-        if pair["case"] == 1:
-            still_arb = valbz_high[0] - vale_low[0] - VALE_FEE > MIN_ARB_PROFIT
-        else:
-            still_arb = vale_high[0] - valbz_low[0] - VALE_FEE > MIN_ARB_PROFIT
+    # cancel pairs whose arb condition has disappeared
+    for oid, pair in list(arb.items()):
+        if oid != pair["buy_id"]:
+            continue
+        if pair["case"] == 1: # buy VALE, short VALBZ
+            still_arb = bzb[0] - va[0] - VALE_FEE > MIN_ARB_PROFIT
+        else: # buy VALBZ, short VALE
+            still_arb = vb[0] - bza[0] - VALE_FEE > MIN_ARB_PROFIT
         if not still_arb:
-            if buy_id in orders:
-                cancel_order(exchange, buy_id)
+            if pair["buy_id"] in orders:
+                cancel_order(exchange, pair["buy_id"])
             if pair["sell_id"] in orders:
                 cancel_order(exchange, pair["sell_id"])
 
-    if valbz_high[0] - vale_low[0] - VALE_FEE > MIN_ARB_PROFIT:  # CASE 1: buy VALE, short VALBZ
+    # create new pairs
+    if bzb[0] - va[0] - VALE_FEE > MIN_ARB_PROFIT:  # CASE 1: buy VALE, short VALBZ
         size = min(
-            vale_low[1],
-            valbz_high[1],
+            va[1],
+            bzb[1],
             POSITION_LIMIT["VALE"]  - position["VALE"]  - inflight_buy["VALE"],
             POSITION_LIMIT["VALBZ"] + position["VALBZ"] - inflight_sell["VALBZ"],
         )
         if size > 0:
-            buy_id  = place_order(exchange, "VALE",  "BUY",  vale_low[0],   size)
-            sell_id = place_order(exchange, "VALBZ", "SELL", valbz_high[0], size)
-            inflight_buy["VALE"]   += size
+            bid = place_order(exchange, "VALE", "BUY",  va[0],  size)
+            sid = place_order(exchange, "VALBZ", "SELL", bzb[0], size)
+            inflight_buy["VALE"]  += size
             inflight_sell["VALBZ"] += size
-            arb_pairs[buy_id] = {
-                "sell_id": sell_id, "size": size,
-                "buy_filled": 0, "sell_filled": 0, "converted": 0,
-                "buy_done": False, "sell_done": False, "case": 1,
-            }
-            arb_pair_by_sell[sell_id] = buy_id
-
-    elif vale_high[0] - valbz_low[0] - VALE_FEE > MIN_ARB_PROFIT:  # CASE 2: buy VALBZ, short VALE
+            pair = { "buy_id": bid, "sell_id": sid, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 1 }
+            arb[bid] = arb[sid] = pair
+    elif vb[0] - bza[0] - VALE_FEE > MIN_ARB_PROFIT:  # CASE 2: buy VALBZ, short VALE
         size = min(
-            valbz_low[1],
-            vale_high[1],
+            bza[1],
+            vb[1],
             POSITION_LIMIT["VALBZ"] - position["VALBZ"] - inflight_buy["VALBZ"],
             POSITION_LIMIT["VALE"]  + position["VALE"]  - inflight_sell["VALE"],
         )
         if size > 0:
-            buy_id  = place_order(exchange, "VALBZ", "BUY",  valbz_low[0],  size)
-            sell_id = place_order(exchange, "VALE",  "SELL", vale_high[0],  size)
+            bid  = place_order(exchange, "VALBZ", "BUY",  bza[0],  size)
+            sid = place_order(exchange, "VALE",  "SELL", vb[0],  size)
             inflight_buy["VALBZ"]  += size
             inflight_sell["VALE"]  += size
-            arb_pairs[buy_id] = {
-                "sell_id": sell_id, "size": size,
-                "buy_filled": 0, "sell_filled": 0, "converted": 0,
-                "buy_done": False, "sell_done": False, "case": 2,
-            }
-            arb_pair_by_sell[sell_id] = buy_id
+            pair = {"buy_id": bid, "sell_id": sid, "size": size, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 2}
+            arb[bid] = arb[sid] = pair
 
 
 # ~~~~~============== MARKET MAKING ==============~~~~~
@@ -378,16 +311,17 @@ def main():
 
             if symbol == "BOND":
                 trade_bond(exchange)
-                pass
-            elif symbol in ("VALE", "VALBZ"):
-                if order_id in arb_pairs:
-                    arb_pairs[order_id]["buy_filled"] += size
-                    arb_convert(exchange, order_id)
-                elif order_id in arb_pair_by_sell:
-                    buy_id = arb_pair_by_sell[order_id]
-                    if buy_id in arb_pairs:
-                        arb_pairs[buy_id]["sell_filled"] += size
-                        arb_convert(exchange, buy_id)
+            elif symbol in ["VALBZ", "VALE"] and order_id in arb:
+                pair = arb[order_id]
+                if order_id == pair["buy_id"]:
+                    pair["buy_filled"] += size
+                else:
+                    pair["sell_filled"] += size
+                to_convert = min(pair["buy_filled"] - pair["converted"], pair["sell_filled"] - pair["converted"])
+                if to_convert > 0:
+                    conv_dir = "SELL" if pair["case"] == 1 else "BUY"
+                    convert(exchange, "VALE", conv_dir, to_convert)
+                    pair["converted"] += to_convert
             # else:
             #     place_mm(exchange, symbol)
             #     print("trade:", message, file=sys.stderr)
@@ -414,8 +348,27 @@ def main():
                     inflight_buy[sym]  -= remaining
                 else:
                     inflight_sell[sym] -= remaining
-            arb_order_finished(exchange, order_id)
-
+                if sym == "BOND":
+                    trade_bond(exchange)
+            if order_id in arb:
+                pair = arb.pop(order_id)
+                is_buy = (order_id == pair["buy_id"])
+                if is_buy:
+                    excess = pair["sell_filled"] - pair["buy_filled"]
+                    if excess > 0:
+                        sym = "VALBZ" if pair["case"] == 1 else "VALE"
+                        ref = best_ask.get(sym)
+                        if ref:
+                            place_order(exchange, sym, "BUY", ref[0], excess)
+                            inflight_buy[sym] += excess
+                else:
+                    excess = pair["buy_filled"] - pair["sell_filled"]
+                    if excess > 0:
+                        sym = "VALE" if pair["case"] == 1 else "VALBZ"
+                        ref = best_bid.get(sym)
+                        if ref:
+                            place_order(exchange, sym, "SELL", ref[0], excess)
+                            inflight_sell[sym] += excess
         elif t == "reject":
             print("reject:", message, file=sys.stderr)
         elif t == "error":
