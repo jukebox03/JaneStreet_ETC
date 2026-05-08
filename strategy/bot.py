@@ -11,6 +11,7 @@ from enum import Enum
 import sys
 import socket
 import orjson
+from strategy.simulation.exchange import exchange
 
 # ~~~~~============== CONFIGURATION  ==============~~~~~
 # replace REPLACEME with your team name!
@@ -479,12 +480,7 @@ def soft_unwind(exchange, symbol):
     if pos > 0:
         # 손해보는 방향의 quote는 즉시 취소
         cancel_quote(exchange, symbol, "BUY")
-
-        # 이득 방향의 quote도 취소 후 새 가격으로 ## is it useful ???
-        key = (symbol, "SELL")
-        old_id = mm_orders.get(key)
-        if old_id:
-            cancel_order(exchange, old_id)
+        cancel_quote(exchange, symbol, "SELL")
         
         # 이득 방향의 새 order
         sell_price = fair_price + ask_d
@@ -495,12 +491,7 @@ def soft_unwind(exchange, symbol):
     elif pos < 0:
         # 손해보는 방향의 quote는 즉시 취소
         cancel_quote(exchange, symbol, "SELL")
-
-        # 이득 방향의 quote도 취소 후 새 가격으로 ## is it useful ???
-        key = (symbol, "BUY")
-        old_id = mm_orders.get(key)
-        if old_id:
-            cancel_order(exchange, old_id)
+        cancel_quote(exchange, symbol, "BUY")
 
         # 이득 방향의 새 order
         buy_price = fair_price - bid_d
