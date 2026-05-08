@@ -199,6 +199,23 @@ class OscillationEffect(Effect):
         return f"oscillation {self.symbol} ±{self.amplitude:.0f}"
 
 
+# ── FORCED SCENARIOS ──────────────────────────────────────────────────────
+# 원하는 시나리오를 추가하세요. 되돌리려면 아래 리스트 항목들을 주석 처리하세요.
+# 형식: (라운드_시작_후_몇_초, EffectClass, *생성자_인자들)
+# 300초 라운드 기준: 초반=0~60, 중반=100~200, 후반=200~280
+FORCED_SCENARIOS = [
+    # 예시: 중반(180초)에 sector drift -1.61/s 를 40초간
+    # (60, SectorCorrelationEffect, 40, -1.83), # -1.61),
+
+    # 예시: 초반(30초)에 GS 급락 shock
+    # (30, ShockEffect, "GS", -40),
+
+    # 예시: 후반(220초)에 변동성 3배, 20초간
+    # (220, VolatilityEffect, 20, 3.0),
+]
+# ─────────────────────────────────────────────────────────────────────────
+
+
 class MarketEngine:
     """Drives fair-value evolution and schedules market scenarios."""
 
@@ -211,6 +228,7 @@ class MarketEngine:
         self.last_tick = now
         self.round_start = now
         self.next_scenario_at = now + self._rng.uniform(8, 20)
+        self._forced_pending = list(FORCED_SCENARIOS)
 
     def reset(self):
         now = time.monotonic()
@@ -219,6 +237,7 @@ class MarketEngine:
         self.last_tick = now
         self.round_start = now
         self.next_scenario_at = now + self._rng.uniform(8, 20)
+        self._forced_pending = list(FORCED_SCENARIOS)
 
     def tick(self):
         t = time.monotonic()
@@ -237,6 +256,19 @@ class MarketEngine:
         for effect in self.effects:
             if effect.is_active(t):
                 effect.apply(self.state, t, dt)
+
+        # FORCED_SCENARIOS 주입 — 되돌리려면 FORCED_SCENARIOS 리스트를 비우세요
+        elapsed = t - self.round_start
+        remaining = []
+        for entry in self._forced_pending:
+            delay, cls, *args = entry
+            if elapsed >= delay:
+                effect = cls(t, *args)
+                self.effects.append(effect)
+                self._log(f"[forced] {effect.describe()}")
+            else:
+                remaining.append(entry)
+        self._forced_pending = remaining
 
         self.state.fair_prices["BOND"] = 1000.0
 
