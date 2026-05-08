@@ -83,7 +83,7 @@ orders = {}
 converts = {}
 
 # arb
-# bid/sid -> { buy_id, sell_id, buy_filled, sell_filled, converted, case }
+# bid/sid -> { buy_id, sell_id, buy_price, sell_price, buy_filled, sell_filled, converted, case }
 arb = {}
 
 # ~~~~~============== NETWORKING CODE ==============~~~~~
@@ -154,9 +154,9 @@ def trade_adr(exchange):
         if oid != pair["buy_id"]:
             continue
         if pair["case"] == 1: # buy VALE, short VALBZ
-            still_arb = bzb[0] - va[0] - VALE_FEE > MIN_ARB_PROFIT
+            still_arb = va[0] <= pair["buy_price"] and bzb[0] >= pair["sell_price"]
         else: # buy VALBZ, short VALE
-            still_arb = vb[0] - bza[0] - VALE_FEE > MIN_ARB_PROFIT
+            still_arb = bza[0] <= pair["buy_price"] and vb[0] >= pair["sell_price"]
         if not still_arb:
             if pair["buy_id"] in orders:
                 cancel_order(exchange, pair["buy_id"])
@@ -176,7 +176,7 @@ def trade_adr(exchange):
             sid = place_order(exchange, "VALBZ", "SELL", bzb[0], size)
             inflight_buy["VALE"]  += size
             inflight_sell["VALBZ"] += size
-            pair = { "buy_id": bid, "sell_id": sid, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 1 }
+            pair = { "buy_id": bid, "sell_id": sid, "buy_price": va[0], "sell_price": bzb[0], "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 1 }
             arb[bid] = arb[sid] = pair
     elif vb[0] - bza[0] - VALE_FEE > MIN_ARB_PROFIT:  # CASE 2: buy VALBZ, short VALE
         size = min(
@@ -190,7 +190,7 @@ def trade_adr(exchange):
             sid = place_order(exchange, "VALE",  "SELL", vb[0],  size)
             inflight_buy["VALBZ"]  += size
             inflight_sell["VALE"]  += size
-            pair = {"buy_id": bid, "sell_id": sid, "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 2}
+            pair = {"buy_id": bid, "sell_id": sid, "buy_price": bza[0], "sell_price": vb[0], "buy_filled": 0, "sell_filled": 0, "converted": 0, "case": 2}
             arb[bid] = arb[sid] = pair
 
 
