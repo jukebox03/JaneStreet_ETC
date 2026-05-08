@@ -42,35 +42,43 @@ POSITION_LIMIT = {
 }
 
 # Market Making
-MM_SYMBOLS = ["GS", "MS", "WFC"] # except VALBZ and VALE
-MM_WINDOW_RATIO = 0.008 # 0.003 is bad
+MM_SYMBOLS = ["GS", "MS", "WFC"] # except VALBZ, VALE and XLF
 HARD_LIMIT  = {"GS": 15, "MS": 15, "WFC": 15} # 15
 SKEW_K = 0.8 # 0.4 is bad
 mm_orders = {} # (symbol, side) -> order_id
 
-# emergency close # ewma # fast가 정찰단 느낌
+# emergency close # ewma # fast가 최근, slow가 평소를 담당(finding emergency)
 PRICE_ALPHA_FAST = 0.2 # avg # EWMA alpha (degradation) ~ 0.1 means considering latest 10% value
 PRICE_ALPHA_SLOW = 0.05
 VOL_ALPHA_FAST = 0.15 # variance # EWMA alpha (degradation) ~ 0.1 means considering latest 10% value
-VOL_ALPHA_SLOW = 0.01 # slow for finding out emergency
+VOL_ALPHA_SLOW = 0.01
+VOL_MAX = 5.0 # VOL's hard stop
+
+# z-values
 DRIFT_K = 3.5 # z-score threshold to pause trading (close MM)
 RESUME_K = 1.0 # z-score threshold to resume trading (restart MM)
+LOCAL_STABLE_K = 1.5 # z for define local stable
+
 FLUSH_MIN_CD = 5 # minimum cooldown time
 
+# ewma list
 ewma_price_fast = {} # symbol -> ewma_price
 ewma_price_slow = {} # symbol -> ewma_price
 ewma_vol_fast = {} # symbol -> ewma_vol
 ewma_vol_slow = {} # symbol -> ewma_vol
 
+# flush = emergency close = 가진 주식이 떨어지는 방향(공매도에서는 값이 증가하는 방향)으로 이동 = 당장 시장가 부근에 팔기 + mm 멈추기
+# soft unwind = 가진 주식이 증가하는 방향 = 천천히 팔기 + mm 멈추기
 in_flush       = {s: False for s in SYMBOLS}    # whether currently in flush
 in_soft_unwind = {s: False for s in MM_SYMBOLS} # non-adverse high-z: one-sided unwind to 0
 flush_min      = {s: 0     for s in SYMBOLS}    # minimum cooldown counter
 flush_oid      = {s: None  for s in MM_SYMBOLS} # order_id of active flush order (Bug 4)
 
 EMERGENCY_BEST_COST_RANGE = 0.3 # market price * 0.7 ~ market price * 1.3
-EMERGENCY_UNSTABLE_COST_DELTA = 50 # TODO : should be dynamic
+EMERGENCY_UNSTABLE_COST_DELTA = 50 # TODO : should be dynamic?
 GHOST_TICK_DELTA_RATIO = 0.3 # threshold for ghost tick detection
 
+# for exit of emergency close
 last_raw_price = {}
 stable_count = {}
 
@@ -292,7 +300,8 @@ def trade_adr(exchange):
 
 # ~~~~~============== MARKET MAKING ==============~~~~~
 
-# basic MM
+### basic MM ###
+# update quote
 def replace_quote(exchange, symbol, side, price):
     key = (symbol, side)
     old_id = mm_orders.get(key)
@@ -301,6 +310,7 @@ def replace_quote(exchange, symbol, side, price):
     new_id = place_order(exchange, symbol, side, price, int(MAX_ORDERS * MM_order_ratio))
     mm_orders[key] = new_id
 
+# cancel quote
 def cancel_quote(exchange, symbol, side):
     key = (symbol, side)
     if mm_orders.get(key) is None:
@@ -311,15 +321,26 @@ def cancel_quote(exchange, symbol, side):
         mm_orders[key] = None
 
 # dynamic delta
-## ev fast for window(delta)
-def calc_skewed_delta(symbol, base_d):
+## ev fast for calc delta
+def calc_skewed_delta(symbol):
+    ev_fast = ewma_vol_fast.get(symbol, 1.0)
+    ev_slow = ewma_vol_slow.get(symbol, 1.0)
+    vol = max(ev_fast, ev_slow)
+
+    fair_price = fair.get(symbol, 0)
+    min_delta = max(2, int(fair_price * 0.004))
+    delta = max(min_delta, vol * 1.2) # 역선택 방지
+
+    # delta = max(5, vol * 1.2) # 그냥.. 이런 식으로 hard coding하거나 해도?
+
     limit = HARD_LIMIT[symbol]
     norm = max(-1.0, min(1.0, position[symbol] / limit)) # long position -> position >> 0 and norm ~= 1 -> low buy, high sell
-    bid_d = max(1, int(base_d * (1 + SKEW_K * norm))) # high buying price in long position -> low buy
-    ask_d = max(1, int(base_d * (1 - SKEW_K * norm))) # low selling price in long position -> high sell
+    bid_d = max(1, int(delta * (1 + SKEW_K * norm))) # high buying price in long position -> low buy
+    ask_d = max(1, int(delta * (1 - SKEW_K * norm))) # low selling price in long position -> high sell
     return bid_d, ask_d
 
-# EWMA for emergency close
+### EWMA(price=avg & vol=standard deviation) for emergency close ###
+# update ewma
 def update_ewma(symbol, price):
     ep_slow = ewma_price_slow.get(symbol, price)
     ep_fast = ewma_price_fast.get(symbol, price)
@@ -330,12 +351,19 @@ def update_ewma(symbol, price):
     ep_fast_now = ep_fast * (1 - PRICE_ALPHA_FAST) + price * PRICE_ALPHA_FAST
     ewma_price_fast[symbol] = ep_fast_now
 
+    # variables for calculating two conditions below
     last_p = last_raw_price.get(symbol, price)
     last_raw_price[symbol] = price
-    dynamic_threshold = max(ev_slow, 1.0) * 1.5
 
+    price_ratio = (price / ep_slow) if (ep_slow is not None and ep_slow > 0) else 1.0
+    scaled_ev_slow = ev_slow * price_ratio
+    
+    normal_dev = max(scaled_ev_slow, 1.0) # 너무 편차가 심하면 그냥 hard coding해서 clipping 하는게..? 어쩌면
+    dynamic_threshold = normal_dev * LOCAL_STABLE_K
+
+    # two conditions for local stability(=condition of exiting steep change)
     gap_closed = abs(price - ep_fast_now) < dynamic_threshold
-    price_flat = abs(price - last_p) < dynamic_threshold
+    price_flat = abs(price - last_p) < (dynamic_threshold * 4) # is * 4 useful ???
 
     if gap_closed and price_flat:
         stable_count[symbol] = stable_count.get(symbol, 0) + 1
@@ -349,25 +377,40 @@ def update_ewma(symbol, price):
         if is_locally_stable: # exit logic
             ewma_price_slow[symbol] = price
             stable_count[symbol] = 0
+
+            # larger variance after steep change
+            ## experimentally, is it useful ??
+            crash_distance = abs(price - ep_slow)
+            ewma_vol_fast[symbol] = max(ev_fast, crash_distance * 0.1)
+            ewma_vol_slow[symbol] = max(ev_slow, crash_distance * 0.05)
         else:
             print(f"[IGNORED_UNSTABLE_TICK] {symbol} price={price} ewma_fast={ep_fast_now:.1f} dev={dev:.1f} vol_fast={ev_fast:.1f} vol_slow={ev_slow:.1f}", file=sys.stderr)
-            return
+            pass
         return
 
+    # paused for steep change
     paused = in_flush.get(symbol, False) or in_soft_unwind.get(symbol, False)
     if not paused:
         ewma_price_slow[symbol] = ep_slow * (1 - PRICE_ALPHA_SLOW) + price * PRICE_ALPHA_SLOW
         ewma_vol_slow[symbol] = ev_slow * (1 - VOL_ALPHA_SLOW) + dev * VOL_ALPHA_SLOW
         ewma_vol_fast[symbol] = ev_fast * (1 - VOL_ALPHA_FAST) + dev * VOL_ALPHA_FAST
 
-## ep, ev slow for z
+## z score으로 flush / soft unwind 판단
+# use slow ep & slow ev for z
 def z_score_abs(symbol, price):
     ep_slow = ewma_price_slow.get(symbol)
     ev_slow = ewma_vol_slow.get(symbol)
+
     if ep_slow is None or ev_slow is None or ev_slow < 1: # TODO : ev == 0 ??
         return 0
-    return abs(price - ep_slow) / ev_slow # TODO : why abs?
 
+    min_vol = ep_slow * 0.01
+    # min_vol = max(ep_slow * 0.01, 3.0)
+    adjusted_vol = max(ev_slow, min_vol)
+
+    return abs(price - ep_slow) / adjusted_vol
+
+# flush 판단
 def is_flush(symbol, price):
     ep_slow = ewma_price_slow.get(symbol)
     ev_slow = ewma_vol_slow.get(symbol)
@@ -378,6 +421,7 @@ def is_flush(symbol, price):
     reverse = (dev < 0 and pos > 0) or (dev > 0 and pos < 0) # position in the opposite direction of drift -> risky
     return reverse and abs(dev) > DRIFT_K * ev_slow  # same with "z > DRIFT_K"
 
+# stable 판단 - flush를 끝낼지 - 그런데 너무 편차가 큰 경우, 실제 수렴 여부는 update_ewma() 내부의 ghost tick detection과 stable count로 판단됨
 def is_stable(symbol, price):
     ep_slow = ewma_price_slow.get(symbol)
 
@@ -385,31 +429,40 @@ def is_stable(symbol, price):
         return False
     return z_score_abs(symbol, price) < RESUME_K
 
+# emergency close on is_flush
 def emergency_close(exchange, symbol):
+    # cancel all existing quote
     cancel_quote(exchange, symbol, "BUY")
     cancel_quote(exchange, symbol, "SELL")
 
     pos = position[symbol]
     fair_price = fair.get(symbol)
     flush_oid[symbol] = None
+
     if pos > 0:
         ref = best_bid.get(symbol)
-        price = ref[0] if ref and ref[0] >= fair_price * (1 - EMERGENCY_BEST_COST_RANGE) else int(fair_price * 0.99)
+        # price = ref[0] if ref and ref[0] >= fair_price * (1 - EMERGENCY_BEST_COST_RANGE) else int(fair_price * 0.95)
+        price = fair_price * 0.95
         oid = place_order(exchange, symbol, "SELL", price, pos)
         flush_oid[symbol] = oid
         mm_orders[(symbol, "SELL")] = oid
+
     elif pos < 0:
         ref = best_ask.get(symbol)
-        price = ref[0] if ref and ref[0] <= fair_price * (1 + EMERGENCY_BEST_COST_RANGE) else int(fair_price * 1.01)
+        # price = ref[0] if ref and ref[0] <= fair_price * (1 + EMERGENCY_BEST_COST_RANGE) else int(fair_price * 1.05)
+        price = fair_price * 1.05
         oid = place_order(exchange, symbol, "BUY", price, -pos)
         flush_oid[symbol] = oid
         mm_orders[(symbol, "BUY")] = oid
+
     else:
         price = None
+    
     in_flush[symbol] = True
     flush_min[symbol] = FLUSH_MIN_CD
     print(f"[FLUSH] {symbol} pos={pos} fair={fair_price} price={price}", file=sys.stderr)
 
+# soft unwind on high z without flush condition (non-adverse drift)
 def soft_unwind(exchange, symbol):
     pos = position[symbol]
     fair_price = fair.get(symbol)
@@ -420,31 +473,46 @@ def soft_unwind(exchange, symbol):
             fair_price = (b[0] + a[0]) // 2
     if not fair_price:
         return
-    delta = max(2, int(fair_price * MM_WINDOW_RATIO))
+    
+    bid_d, ask_d = calc_skewed_delta(symbol)
+
     if pos > 0:
+        # 손해보는 방향의 quote는 즉시 취소
         cancel_quote(exchange, symbol, "BUY")
+
+        # 이득 방향의 quote도 취소 후 새 가격으로 ## is it useful ???
         key = (symbol, "SELL")
         old_id = mm_orders.get(key)
         if old_id:
             cancel_order(exchange, old_id)
-        sell_price = fair_price + delta
+        
+        # 이득 방향의 새 order
+        sell_price = fair_price + ask_d
         new_id = place_order(exchange, symbol, "SELL", sell_price, pos)
         mm_orders[key] = new_id
         print(f"[SOFT_UNWIND_ORDER] {symbol} SELL {pos} @ {sell_price} (fair={fair_price})", file=sys.stderr)
+    
     elif pos < 0:
+        # 손해보는 방향의 quote는 즉시 취소
         cancel_quote(exchange, symbol, "SELL")
+
+        # 이득 방향의 quote도 취소 후 새 가격으로 ## is it useful ???
         key = (symbol, "BUY")
         old_id = mm_orders.get(key)
         if old_id:
             cancel_order(exchange, old_id)
-        buy_price = fair_price - delta
+
+        # 이득 방향의 새 order
+        buy_price = fair_price - bid_d
         new_id = place_order(exchange, symbol, "BUY", buy_price, -pos)
         mm_orders[key] = new_id
         print(f"[SOFT_UNWIND_ORDER] {symbol} BUY {-pos} @ {buy_price} (fair={fair_price})", file=sys.stderr)
+    
     else:
         cancel_quote(exchange, symbol, "BUY")
         cancel_quote(exchange, symbol, "SELL")
 
+# Market Making -> update quote when it is called(ex. when there is trade/fill)
 def place_mm(exchange, symbol):
     global position
 
@@ -457,8 +525,7 @@ def place_mm(exchange, symbol):
     if not fair_price:
         return
 
-    delta = max(2, int(fair_price * MM_WINDOW_RATIO))
-    bid_delta, ask_delta = calc_skewed_delta(symbol, delta)
+    bid_delta, ask_delta = calc_skewed_delta(symbol)
 
     bid = max(1, int(fair_price - bid_delta))
     ask = max(bid + 1, int(fair_price + ask_delta))
@@ -508,21 +575,34 @@ def main():
             symbol = message["symbol"]
             price = message["price"]
             fair[symbol] = price
+
             if symbol in MM_SYMBOLS:
+                update_ewma(symbol, price)
+
                 if in_flush[symbol]:
+                    # flush 상태
                     if flush_min[symbol] > 0:
                         flush_min[symbol] -= 1
-                    update_ewma(symbol, price)
+
+                    # flush가 진행 중인데 position이 남아있으면(ex. 가격 급변으로 기존 제출가로 flush의 position을 다 털지 못함), 가격 수정 후 재제출
+                    if position[symbol] != 0 and flush_min[symbol] == 1: 
+                        if flush_oid.get(symbol):
+                            cancel_order(exchange, flush_oid[symbol])
+                        emergency_close(exchange, symbol)
+
+                    # flush 해제
                     if flush_min[symbol] == 0 and is_stable(symbol, price):
                         in_flush[symbol] = False
-                        place_mm(exchange, symbol)
+                        place_mm(exchange, symbol) # restart mm
                         print(f"[RESUME] {symbol}", file=sys.stderr)
+                
                 elif in_soft_unwind[symbol]:
+                    # soft unwind 상태
                     if flush_min[symbol] > 0:
                         flush_min[symbol] -= 1
-                    update_ewma(symbol, price)
+
+                    # soft unwind 중에, flush 상황이 되면 flush
                     if is_flush(symbol, price) and position[symbol] != 0:
-                        # direction reversed → became adverse, escalate to emergency close
                         ep_slow = ewma_price_slow.get(symbol, price)
                         ev_slow = ewma_vol_slow.get(symbol, 1)
                         dev = price - ep_slow
@@ -530,24 +610,35 @@ def main():
                         print(f"[FLUSH_ESCALATE] {symbol} pos={position[symbol]} price={price} ewma={ep_slow:.1f} dev={dev:+.1f} vol_slow={ev_slow:.1f} z={z:.2f}", file=sys.stderr)
                         in_soft_unwind[symbol] = False
                         emergency_close(exchange, symbol)
+                    
+                    # soft wind 해제
                     elif flush_min[symbol] == 0 and is_stable(symbol, price):
                         in_soft_unwind[symbol] = False
                         place_mm(exchange, symbol)
                         print(f"[RESUME] {symbol}", file=sys.stderr)
+
+                    # position==0이면 그냥 주문만 취소
                     elif position[symbol] == 0:
                         cancel_quote(exchange, symbol, "BUY")
                         cancel_quote(exchange, symbol, "SELL")
+                    
                     else:
                         soft_unwind(exchange, symbol)
+                
+                # z값이 커서 pause(flush or soft unwind) 상태로 진입
                 elif z_score_abs(symbol, price) > DRIFT_K:
-                    update_ewma(symbol, price)
+                    # z uses slow variables(ep, ev)
                     ep_slow = ewma_price_slow.get(symbol, price)
                     ev_slow = ewma_vol_slow.get(symbol, 1)
                     dev = price - ep_slow
                     z = abs(dev) / ev_slow if ev_slow >= 1 else 0
+
+                    # flush case (adverse drift)
                     if is_flush(symbol, price) and position[symbol] != 0:
                         print(f"[FLUSH_TRIGGER] {symbol} pos={position[symbol]} price={price} ewma={ep_slow:.1f} dev={dev:+.1f} vol_slow={ev_slow:.1f} z={z:.2f}", file=sys.stderr)
                         emergency_close(exchange, symbol)
+
+                    # soft unwind case (non-adverse drift) or position is 0
                     else:
                         in_soft_unwind[symbol] = True
                         flush_min[symbol] = FLUSH_MIN_CD
@@ -557,10 +648,12 @@ def main():
                             cancel_quote(exchange, symbol, "SELL")
                         else:
                             soft_unwind(exchange, symbol)
+
                 else:
-                    update_ewma(symbol, price)
                     place_mm(exchange, symbol)
+
                 # print(f"{t}\t{symbol}\t-\t{price}\t{message['size']}")
+                
         elif t == "fill":
             symbol = message["symbol"]
             size   = message["size"]
@@ -590,6 +683,7 @@ def main():
             if symbol == "BOND":
                 # trade_bond(exchange)
                 pass
+
             elif symbol in ("VALE", "VALBZ"):
                 # if order_id in arb_pairs:
                 #     arb_pairs[order_id]["buy_filled"] += size
@@ -600,8 +694,9 @@ def main():
                 #         arb_pairs[buy_id]["sell_filled"] += size
                 #         _try_convert_pair(exchange, buy_id)
                 pass
-            elif symbol in MM_SYMBOLS:
-                print(f"FILLLLL\t{symbol}\t{dir}\t{price}\t{size}")
+
+            if symbol in MM_SYMBOLS: # MM symbol이 VALE 등 포함하게 될 수 있음
+                print(f"FILLLLL\t{symbol}\t{dir}\t{price}\t{size}\tvol_slow={ewma_vol_slow.get(symbol, 0):.1f}\tvol_fast={ewma_vol_fast.get(symbol, 0):.1f}", file=sys.stderr)
                 if in_flush[symbol]:
                     pass
                 elif in_soft_unwind[symbol]:
@@ -651,9 +746,10 @@ def main():
                             if ref and fp and ref[0] >= fp * (1 - EMERGENCY_BEST_COST_RANGE):
                                 price = ref[0]
                             elif fp:
-                                price = int(fp * 0.99)
+                                price = int(fp * 0.95)
                             else:
                                 break
+                            # price = fp * (1 - EMERGENCY_BEST_COST_RANGE) if fp else None
                             oid = place_order(exchange, sym, "SELL", price, pos)
                             flush_oid[sym] = oid
                             mm_orders[(sym, "SELL")] = oid
@@ -662,9 +758,10 @@ def main():
                             if ref and fp and ref[0] <= fp * (1 + EMERGENCY_BEST_COST_RANGE):
                                 price = ref[0]
                             elif fp:
-                                price = int(fp * 1.01)
+                                price = int(fp * 1.05)
                             else:
                                 break
+                            # price = fp * (1 + EMERGENCY_BEST_COST_RANGE) if fp else None
                             oid = place_order(exchange, sym, "BUY", price, -pos)
                             flush_oid[sym] = oid
                             mm_orders[(sym, "BUY")] = oid

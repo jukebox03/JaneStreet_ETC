@@ -204,8 +204,8 @@ class OscillationEffect(Effect):
 # 형식: (라운드_시작_후_몇_초, EffectClass, *생성자_인자들)
 # 300초 라운드 기준: 초반=0~60, 중반=100~200, 후반=200~280
 FORCED_SCENARIOS = [
-    # 예시: 중반(180초)에 sector drift -1.61/s 를 40초간
-    # (60, SectorCorrelationEffect, 40, -1.83), # -1.61),
+    # 예시: 60초에 sector drift -1.83/s 를 40초간
+    (60, SectorCorrelationEffect, 40, -1.83),
 
     # 예시: 초반(30초)에 GS 급락 shock
     # (30, ShockEffect, "GS", -40),
